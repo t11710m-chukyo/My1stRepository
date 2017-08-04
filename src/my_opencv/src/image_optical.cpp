@@ -4,22 +4,30 @@
 #include <sensor_msgs/image_encodings.h>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
-#include "opencv2/opencv.hpp"
 
-#include <iostream>
-#include <opencv2/features2d/features2d.hpp>
-#include "opencv2/core.hpp"
-#include "opencv2/features2d.hpp"
-#include "opencv2/highgui.hpp"
-#include "opencv2/calib3d.hpp"
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <iostream>
-#include <vector>
-#include <algorithm>
+#include "string.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "iostream"
+#include "math.h"
+#include "opencv/cv.h"
+#include "opencv2/core/core.hpp"
+#include "opencv2/video/tracking.hpp"
+#include "opencv2/Labeling.h"
+
+#define MAX_VAL 0
+#define MIN_VAL 255
+#define FG      255
+#define BG      0
+
+using namespace std;
+using namespace cv;
+int frame_count = 0;
 
 static const std::string OPENCV_WINDOW = "Image window";
+
+cv::Mat source_image; 
+cv::Mat prev_image; 
 
 class ImageConverter
 {
@@ -32,7 +40,6 @@ public:
   ImageConverter()
     : it_(nh_)
   {
-    // Subscrive to input video feed and publish output video feed
     image_sub_ = it_.subscribe("/usb_cam/image_raw", 1,
       &ImageConverter::imageCb, this);
     image_pub_ = it_.advertise("/image_converter/output_video", 1);
@@ -58,60 +65,102 @@ public:
       return;
     }
 
+    cv::cvtColor( cv_ptr->image, source_image, CV_BGR2GRAY );
+    image_pub_.publish( cv_bridge::CvImage( std_msgs::Header(), "bgr8", source_image).toImageMsg());
+    
+    // Setting the image for display
+    Mat org_flow = cv::Mat::ones(cv::Size(source_image.cols,source_image.rows),CV_8UC1)*BG;
 
-    // Draw an example circle on the video stream
-    if (cv_ptr->image.rows > 60 && cv_ptr->image.cols > 60)
-      cv::circle(cv_ptr->image, cv::Point(50, 50), 10, CV_RGB(255,0,0));
+    if( frame_count == 0 ) prev_image = source_image.clone();
 
-      // ######### 0529 add -start #########
-      cv::Mat gray,prev,next;
-      cv::cvtColor(cv_ptr->image, gray, CV_BGR2GRAY);
-      //cv_ptr->image = gray;
-      //image_pub_.publish( cv_bridge::CvImage(std_msgs::Header(), "bgr8", gray).toImageMsg());
-      // RGB..."bgr8" GRAY..."mono8"
-      // ######### 0529 add -end #########
-
-      if( gray.empty() ){
-        cv::cvtColor( gray , prev , CV_BGR2GRAY ) ;
+    if( frame_count > 0 )
+    {
+    	vector<cv::Point2f> prev_pts;
+    	vector<cv::Point2f> next_pts;
+    	
+      // Define of the number of optical flow (To detect a object:image size, To display a flow:one-tens image size) 
+    	Size flowSize(source_image.rows,source_image.cols);
+    	
+    	Point2f center = cv::Point(source_image.cols/2., source_image.rows/2.);
+      for(int i=0; i<flowSize.width; ++i)
+      {
+      	for(int j=0; j<flowSize.width; ++j)
+      	{
+      		Point2f p(i*float(source_image.cols)/(flowSize.width-1), j*float(source_image.rows)/(flowSize.height-1));
+          prev_pts.push_back((p-center)*0.95f+center);
+        }
       }
-      cv::cvtColor( gray , next , CV_BGR2GRAY ) ;
+    
+      // Calculation of optical flow
+    	Mat flow;
+    	calcOpticalFlowFarneback(prev_image, source_image, flow, 0.8, 10, 15, 3, 5, 1.1, 0);
+            
+      // Drawing the optical flow
+    	std::vector<cv::Point2f>::const_iterator p = prev_pts.begin();
+    	for(; p!=prev_pts.end(); ++p)
+    	{
+    		const cv::Point2f& fxy = flow.at<cv::Point2f>(p->y, p->x);
+        double val_flow = flow.at<double>(p->y,p->x);
 
-      std::vector<cv::Point2f> prev_pts ;
-      std::vector<cv::Point2f> next_pts ;
+        // Check the value of threshold and radius
+        if( val_flow > 10.0) cv::circle(org_flow, cv::Point(p->x,p->y), 1,cv::Scalar(FG), -1, 8, 0);
+        // Check the value of gain ( *p+fxy*" " )
+        if( val_flow > 10.0) cv::line(org_flow, *p, *p+fxy*8, cv::Scalar(FG), 1);
+    	}
+    	
+      // Saving the source_image into prev_image 
+      prev_image = source_image.clone();
 
-      std::vector<cv::KeyPoint> keypoints;
+      // Morphology calculation 
+      cv::Mat element(3, 3, CV_8U,cv::Scalar::all(255));
+      cv::Mat dilate_flow = org_flow.clone();
+      cv::erode(dilate_flow, dilate_flow, cv::Mat(), cv::Point(-1,-1), 10); // Check the number of erodion
+      //cv::dilate(dilate_flow, dilate_flow, cv::Mat(), cv::Point(-1,-1), 30); // Check the number of dilation
 
-      cv::GoodFeaturesToTrackDetector detector(300000, 0.1, 5);
-      detector.detect( prev, keypoints);
-
-      for( std::vector<cv::KeyPoint>::iterator itk = keypoints.begin(); itk != keypoints.end(); ++itk){
-          prev_pts.push_back(itk->pt);
+      // Labeling
+      LabelingBS labeling;
+      unsigned char *src = new unsigned char[source_image.cols*source_image.rows];
+      short *result = new short[source_image.cols*source_image.rows];
+      int l=0;
+      for(int j=0 ; j<source_image.rows ; j++)
+      {
+        for(int i=0 ; i<source_image.cols ; i++)
+        {
+           src[l] = dilate_flow.at<unsigned char>(j,i);
+           l++;
+        }
       }
-      std::vector<uchar> status;
-      std::vector<float> error;
+      labeling.Exec(src, result, source_image.cols, source_image.rows, true, 10);
+      int nlabel = labeling.GetNumOfResultRegions();
 
-      cv::calcOpticalFlowPyrLK(prev, next, prev_pts, next_pts, status, error, cv::Size(100,100), 3, cvTermCriteria (CV_TERMCRIT_ITER | CV_TERMCRIT_EPS, 20, 0.05), 0);
-
-      std::vector<cv::Point2f>::const_iterator p = prev_pts.begin();
-      std::vector<cv::Point2f>::const_iterator n = next_pts.begin();
-      for(; n!=next_pts.end(); ++n,++p) {
-          cv::line(gray, *p, *n, cv::Scalar(150,0,0),2);
+      // Calculation of Labeling result
+      RegionInfoBS *ri;
+      for(int k=0 ; k<nlabel ; k++)
+      {
+        ri = labeling.GetResultRegionInfo(k);
+        int minx,miny;
+        int maxx,maxy;
+        ri->GetMin(minx, miny);
+        ri->GetMax(maxx, maxy);
+        cv::rectangle(source_image, cv::Point(minx,miny), cv::Point(maxx,maxy), cv::Scalar(0), 3, 4);
       }
-
-
-    // Update GUI Window
-    //cv::imshow(OPENCV_WINDOW, cv_ptr->image);
-    cv::imshow(OPENCV_WINDOW, gray);
-    cv::waitKey(3);
+            
+      // Display of images
+      imshow("original_optical_flow", org_flow);
+      imshow("dilate_optical_flow", dilate_flow);
+      imshow("source", source_image);
+            
+      int c = waitKey(1);
+     }
 
     // Output modified video stream
-    //image_pub_.publish(cv_ptr->toImageMsg()); //COLOR
-    image_pub_.publish(cv_bridge::CvImage(std_msgs::Header(),"mono8",gray).toImageMsg() ); //GREY
+    image_pub_.publish(cv_ptr->toImageMsg());
+    
+    frame_count++;
 
-    gray.copyTo(gray);
   }
+  
 };
-
 
 int main(int argc, char** argv)
 {
